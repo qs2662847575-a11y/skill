@@ -31,13 +31,21 @@ function Get-DirSizeMB {
         return $null   # 路径不存在；与「存在但为空」返回 0 区分开
     }
 
-    # 走管道逐对象累加以保持 O(1) 内存；
-    # 注意不要改成 foreach 语句，foreach 会先把整棵树的 FileInfo 全部缓冲进内存
-    # 跳过重解析点（junction/symlink），避免重复计算甚至无限递归
-    $sum = 0
-    Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
-        Where-Object { -not $_.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint) } |
-        ForEach-Object { $sum += $_.Length }
+    # 自己显式遍历，而不是依赖 -Recurse：
+    #   - -File 只返回文件，目录 junction/symlink 根本不会被 Where-Object 看到
+    #   - WinPS 5.1 的 -Recurse 会进入 junction 目录，指向上层时重复遍历甚至无限递归
+    # 因此在「进入目录之前」就剪掉重解析点。
+    $sum   = 0
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $current = $stack.Pop()
+        foreach ($entry in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction SilentlyContinue)) {
+            if ($entry.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) { continue }
+            if ($entry.PSIsContainer) { $stack.Push($entry.FullName) }
+            else { $sum += $entry.Length }
+        }
+    }
 
     return [math]::Round($sum / 1MB, 1)
 }
@@ -59,16 +67,31 @@ function Test-PathWithin {
     }
 
     try {
-        # 先归一化为绝对路径（同时消掉相对路径、. 与 .. 片段），再统一分隔符方向。
-        # 顺序很重要：先 GetFullPath 再补尾部分隔符，否则 `\..\..` 这类片段会被拼接破坏。
+        $rootNorm = $Root -replace '/', '\'
+
+        # 只有相对路径才锚定到脚本目录。
+        # Join-Path 不判断是否已绝对：Join-Path $base 'D:\x' 会拼出 `$base\D:\x` 这种畸形路径。
+        if (-not [System.IO.Path]::IsPathRooted($rootNorm)) {
+            # $PSScriptRoot 只在脚本作用域有值，做一次回退，避免空串参与拼接
+            $base = $PSScriptRoot
+            if ([string]::IsNullOrWhiteSpace($base)) {
+                $base = Split-Path -Parent $MyInvocation.MyCommand.Path
+            }
+            if ([string]::IsNullOrWhiteSpace($base)) {
+                $base = (Get-Location).Path
+            }
+            $rootNorm = Join-Path $base $rootNorm
+        }
+
         # 括号必须保留：方法调用里的 `$x -replace '/','\'` 会被解析成两个参数
-        $rootFull  = [System.IO.Path]::GetFullPath(($Root  -replace '/', '\'))
+        $rootFull  = [System.IO.Path]::GetFullPath($rootNorm)
         $childFull = [System.IO.Path]::GetFullPath(($Child -replace '/', '\'))
     }
     catch {
         return $false
     }
 
+    # 归一化之后再补尾部分隔符，否则 `\..\..` 这类片段会被拼接破坏
     $rootWithSep  = $rootFull.TrimEnd('\') + '\'
     $childWithSep = $childFull.TrimEnd('\') + '\'
 
@@ -82,20 +105,21 @@ if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
     exit 2
 }
 
-# npm 输出可能带首尾空白或残留的 CR（.cmd shim 常见），一律 trim 后再比较
-$prefix = ((npm config get prefix) -join '').Trim()
+# 取最后一行非空输出并 trim：npm 可能先打印提示行，也可能带残留的 CR（.cmd shim 常见）
+$prefix = ([string]((npm config get prefix) | Where-Object { $_ -ne '' } | Select-Object -Last 1)).Trim()
 if ($LASTEXITCODE -ne 0) { Write-Host '[ERROR] npm config get prefix 执行失败。'; exit 2 }
 
-$cache = ((npm config get cache) -join '').Trim()
+$cache = ([string]((npm config get cache) | Where-Object { $_ -ne '' } | Select-Object -Last 1)).Trim()
 if ($LASTEXITCODE -ne 0) { Write-Host '[ERROR] npm config get cache 执行失败。'; exit 2 }
 
-$rootG = ((npm root -g) -join '').Trim()
+$rootG = ([string]((npm root -g) | Where-Object { $_ -ne '' } | Select-Object -Last 1)).Trim()
 if ($LASTEXITCODE -ne 0) { Write-Host '[ERROR] npm root -g 执行失败。'; exit 2 }
 
 # npm_config_* 环境变量优先级高于 .npmrc：在 DSH 等会话中会把配置覆盖回旧路径，
 # 此时下面读到的 prefix/cache 并不代表 .npmrc 的真实迁移状态。
+# 除 prefix/cache 外，userconfig/globalconfig 会改变「读哪个 .npmrc」，同样使结论失效。
 $overrides = @(Get-ChildItem env: |
-        Where-Object { $_.Name -like 'npm_config_*' -and $_.Name -match 'prefix|cache' } |
+        Where-Object { $_.Name -like 'npm_config_*' -and $_.Name -match 'prefix|cache|userconfig|globalconfig|^npm_config_global$' } |
         ForEach-Object { "{0}={1}" -f $_.Name, $_.Value })
 
 $legacyPrefix = if ($env:APPDATA) { Join-Path $env:APPDATA 'npm' } else { $null }
@@ -159,13 +183,14 @@ else {
     Write-Host ("{0} = {1} MB" -f $ExpectedRoot, $targetSize)
 }
 
+# 存在 npm_config_* 覆盖时，读到的值反映的是当前 shell 而非 .npmrc，
+# 无论路径判定结果如何都无法代表真实迁移状态，因此优先级高于 0/1 判定。
+if ($overrides.Count -gt 0) {
+    Write-Host '[INCONCLUSIVE] 结果受 npm_config_* 覆盖影响，无法代表 .npmrc 的真实状态。'
+    exit 3
+}
+
 if ($allOnTarget) {
-    # 存在 npm_config_* 覆盖时，结论反映的是当前 shell 而非 .npmrc，
-    # 用独立退出码 3 表达「不确定」，避免把环境问题误报成配置问题
-    if ($overrides.Count -gt 0) {
-        Write-Host '[INCONCLUSIVE] 结果受 npm_config_* 覆盖影响，无法代表 .npmrc 的真实状态。'
-        exit 3
-    }
     exit 0
 }
 
