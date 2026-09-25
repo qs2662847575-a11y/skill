@@ -1,57 +1,62 @@
 # GitHub Actions 配置指南 —— PR 自动审查
 
-工作流文件已生成在 `.github/workflows/ocr-review.yml`。
+工作流文件：`.github/workflows/ocr-review.yml`
 
-> **当前状态：还不能运行。** 这个仓库没有配置任何 git 远端（`git remote -v` 为空），
-> GitHub 看不到它，Actions 自然不会触发。需要先建仓库并推送。
+## 当前状态：已完成配置 ✅
 
-## 一、创建 GitHub 仓库并推送
+| 项目 | 值 |
+|---|---|
+| 仓库 | https://github.com/qs2662847575-a11y/skill （公开） |
+| Secret | `OCR_LLM_AUTH_TOKEN` 已设置 |
+| Variables | `OCR_LLM_URL`、`OCR_LLM_MODEL`、`OCR_LLM_USE_ANTHROPIC` 已设置 |
+| 工作流状态 | active |
 
-在 GitHub 上新建一个仓库（空仓库，**不要**勾选自动生成 README），然后：
+日常使用：直接提 PR 就会自动审查；在 PR 里评论 `/open-code-review` 可手动重审。
+
+---
+
+## 一、创建仓库并推送（已由配置脚本完成，此节保留备用）
+
+仓库已创建并推送完毕。若将来需要在新机器上重建：
 
 ```powershell
 cd D:\大模型\自动化工作流\skill
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
+git remote add origin https://github.com/qs2662847575-a11y/skill.git
 git push -u origin main
 ```
 
-推送前请确认身份没问题。当前本仓库的提交身份是本地占位值：
+### 本机 git TLS 后端已调整（重要）
 
-```
-user.name  = skill-local
-user.email = skill@local
-```
-
-如果想让提交显示为你的 GitHub 身份，改成真实值（`--global` 会作用于所有仓库，这里只改本仓库更安全）：
+本机 git 原配置的 `http.sslBackend=schannel` 会报
+`schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`，无法访问 GitHub。
+已改为：
 
 ```powershell
-git config user.name  "你的名字"
-git config user.email "你的邮箱"
+git config --global http.sslBackend openssl
 ```
+
+换新机器遇到同样的报错时，执行这一行即可。
+
 
 已经产生的 4 个提交不会改（改历史需要 rebase，本地仓库没必要）。
 
-## 二、配置 Secret 和 Variables
+## 二、Secret 与 Variables（已配置完成，此节留作参考）
 
-进入 GitHub 仓库页面 → **Settings → Secrets and variables → Actions**。
+在 GitHub 仓库页面 → **Settings → Secrets and variables → Actions** 配置如下。
 
-### Secrets 标签页 → New repository secret
-
-| Name | Value |
-|---|---|
-| `OCR_LLM_AUTH_TOKEN` | 你的 DeepSeek API Key（`sk-` 开头） |
-
-### Variables 标签页 → New repository variable
-
-| Name | Value |
-|---|---|
-| `OCR_LLM_URL` | `https://api.deepseek.com` |
-| `OCR_LLM_MODEL` | `deepseek-flash` |
-| `OCR_LLM_USE_ANTHROPIC` | `false` |
+| 类型 | Name | Value |
+|---|---|---|
+| Secret | `OCR_LLM_AUTH_TOKEN` | DeepSeek API Key（`sk-` 开头） |
+| Variable | `OCR_LLM_URL` | `https://api.deepseek.com` |
+| Variable | `OCR_LLM_MODEL` | `deepseek-flash` |
+| Variable | `OCR_LLM_USE_ANTHROPIC` | `false` |
 
 为什么 Key 放 Secret、其余放 Variable：只有 Key 是机密。URL 和模型名放在 Variable 里可以在日志中明文显示，便于排错。
 
 > `GITHUB_TOKEN` 不用配，GitHub 自动提供。
+
+> 换 Key 时：Secret 的值在 GitHub 上不可回读，只能覆盖重设。本机 `ocr` 用的 Key 在
+> `~/.opencodereview/config.json` 里，两处需保持一致。
 
 ## 三、验证
 
