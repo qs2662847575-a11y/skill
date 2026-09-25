@@ -80,3 +80,54 @@ npm install -g @alibaba-group/open-code-review
 | `C:\Users\1234\AppData\Local\npm-cache` | 约 908 MB |
 
 （`Get-PSDrive` 在本机上报剩余空间为 0 是不准确的，实际以 `Win32_LogicalDisk` 为准。）
+
+## 附：open-code-review（ocr）常用命令速查
+
+### 前置条件
+
+`ocr review` 要求当前目录是 Git 仓库，且已配置 LLM 端点。
+
+```powershell
+ocr config provider      # 交互式选厂商 + 填 API Key
+ocr config model         # 选模型
+ocr llm test             # 测连通性
+ocr llm providers        # 列出全部内置厂商
+```
+
+### 审查
+
+```powershell
+ocr review                                  # 工作区：已暂存 + 未暂存 + 未跟踪
+ocr review --from main --to feature-branch  # 分支区间（merge-base）
+ocr review --commit abc123                  # 单个 commit（对比父提交）
+ocr review --preview                        # 只预览范围，不调 LLM
+ocr scan --path src/agent                   # 整文件扫描，不需要 diff
+```
+
+### 输出与查看
+
+```powershell
+ocr review --format json -o review.json     # JSON 输出
+ocr review --audience agent                 # 仅摘要，适合程序消费
+ocr viewer                                  # 浏览器查看历史会话，默认 localhost:5483
+ocr session list                            # 列出当前仓库的会话
+```
+
+### 常用调优参数
+
+| 参数 | 作用 | 默认值 |
+|---|---|---|
+| `--effort` | 审查力度 `low` / `medium` / `high` | `medium` |
+| `--concurrency` | 最大并发子任务数 | 8 |
+| `--exclude` | 逗号分隔的 gitignore 风格排除模式 | 无 |
+| `--background` | 需求/业务背景，提升准确度 | 无 |
+| `--max-tokens-budget` | 卡本次审查总 token 上限，0 为不限 | 0 |
+
+### 免 API Key 的 Delegation 模式
+
+由宿主 agent 用自身模型执行审查，OCR 只负责选文件和套规则：
+
+```powershell
+ocr delegate preview                            # 预览可审查文件
+ocr delegate rule src/main.go src/handler.go    # 输出解析后的审查规则
+```
