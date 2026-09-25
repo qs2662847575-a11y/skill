@@ -45,18 +45,42 @@ function Hide-Credential {
 
 function Get-TimeoutExe {
     <#
-        返回带 timeout 语义的可执行文件。Git for Windows 的 usr\bin 里有 coreutils 版
-        timeout.exe，语义与 busybox timeout 一致。
-        （Git 用硬链接组织这些命令，busybox.exe 这个名字通常并不存在。）
+        返回 coreutils 版的 timeout.exe（Git for Windows 自带）。
+        注意：Windows 自带的 C:\Windows\System32\timeout.exe 语法完全不同
+        （它只用于延迟，不接受要执行的命令），绝不能用。因此先探测 Git 的固定路径，
+        最后才回退 PATH，且 PATH 命中时必须确认来自 Git 目录。
     #>
     $candidates = @(
         (Join-Path $env:ProgramFiles 'Git\usr\bin\timeout.exe'),
-        (Join-Path $env:ProgramFiles 'Git\mingw64\bin\timeout.exe')
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\usr\bin\timeout.exe'),
+        (Join-Path $env:ProgramFiles 'Git\mingw64\bin\timeout.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Git\usr\bin\timeout.exe')
     )
     foreach ($c in $candidates) {
         if ($c -and (Test-Path -LiteralPath $c)) { return $c }
     }
+
+    # PATH 上（如 Git Bash 环境）也可能有，但必须排除 Windows 自带的那只
+    $onPath = Get-Command 'timeout.exe' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($onPath) {
+        $dir = Split-Path -Parent $onPath.Source
+        if ($dir -match '\\Git\\(usr|mingw64)\\bin$') { return $onPath.Source }
+    }
     return $null
+}
+
+function Get-LastConfigValue {
+    <#
+        git config 对同名 key 可能输出多行（多值），git 以最后一个生效，
+        因此取最后一行而不是把所有行拼接起来。
+    #>
+    param([AllowEmptyString()][string]$Name, [string]$Scope = '--global')
+
+    $lines = @(git config $Scope $Name 2>$null)
+    $lines = @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($lines.Count -eq 0) { return '' }
+    return $lines[-1].Trim()
 }
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -65,8 +89,8 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 }
 
 # --- 当前 TLS 配置 ------------------------------------------------------
-$globalBackend = ((git config --global http.sslBackend) -join '').Trim()
-$localBackend = ((git config --local http.sslBackend) -join '').Trim()
+$globalBackend = Get-LastConfigValue -Name 'http.sslBackend' -Scope '--global'
+$localBackend = Get-LastConfigValue -Name 'http.sslBackend' -Scope '--local'
 $effective = if ($localBackend) { $localBackend } else { $globalBackend }
 
 Write-Host '=== 当前 git TLS 配置 ==='
@@ -95,7 +119,10 @@ if ($looksLikeUrl) {
     Write-Host ("(直接使用 URL) -> {0}" -f (Hide-Credential $Remote))
 }
 else {
-    $remoteUrl = ((git remote get-url $Remote 2>$null) -join '').Trim()
+    $remoteUrl = ''
+    $urlLines = @(git remote get-url $Remote 2>$null)
+    $urlLines = @($urlLines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($urlLines.Count -gt 0) { $remoteUrl = $urlLines[-1].Trim() }
     if (-not $remoteUrl) {
         Write-Host ("[WARN] 远端 {0} 不存在。" -f $Remote)
         exit 1
@@ -114,38 +141,62 @@ $stderrFile = [System.IO.Path]::GetTempFileName()
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $exitCode = 0
 
-# Git 自带的 timeout.exe 是 cygwin 程序，在受限沙箱里可能因
-# "couldn't create signal pipe" 直接崩掉（退出码 0xC0000142 = -1073741502）。
-# 那种情况下退回低速阈值方案，而不是把崩溃当成连通性失败。
-$hardTimeoutUsable = [bool]$timeoutExe
+# 原生命令的 stderr 已被重定向到文件，但 PS 5.1 仍会把它包成 ErrorRecord 回显；
+# 这里静默掉，失败信息由脚本自己从 stderrFile 里读取、脱敏后再输出。
+$prefBefore = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
 
-if ($hardTimeoutUsable) {
-    # 硬超时：DNS、TCP 连接、TLS 握手阶段挂起同样会被掐断
-    & $timeoutExe $TimeoutSec git ls-remote $Remote HEAD 1> $stdoutFile 2> $stderrFile
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -eq -1073741502) {
-        $hardTimeoutUsable = $false
-        Write-Host "[WARN] timeout.exe 在当前环境无法启动（couldn't create signal pipe），"
-        Write-Host '       退回低速阈值超时（无法覆盖连接与握手阶段的挂起）。'
-        $exitCode = 0
+# 回退分支会改这两个环境变量，先存原值，结束时恢复，避免污染调用者会话
+$lowSpeedLimitBefore = $env:GIT_HTTP_LOW_SPEED_LIMIT
+$lowSpeedTimeBefore = $env:GIT_HTTP_LOW_SPEED_TIME
+
+$stdout = @()
+$stderr = @()
+
+try {
+    # Git 自带的 timeout.exe 是 cygwin 程序，在受限沙箱里可能因
+    # "couldn't create signal pipe" 直接崩掉（退出码 0xC0000142 = -1073741502）。
+    # 那种情况下退回低速阈值方案，而不是把崩溃当成连通性失败。
+    $hardTimeoutUsable = [bool]$timeoutExe
+
+    if ($hardTimeoutUsable) {
+        # 硬超时：DNS、TCP 连接、TLS 握手阶段挂起同样会被掐断。
+        # credential.interactive=false 避免远端要求认证时挂起等待输入。
+        & $timeoutExe $TimeoutSec git -c credential.interactive=false ls-remote $Remote HEAD 1> $stdoutFile 2> $stderrFile
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq -1073741502) {
+            $hardTimeoutUsable = $false
+            Write-Host "[WARN] timeout.exe 在当前环境无法启动（couldn't create signal pipe），"
+            Write-Host '       退回低速阈值超时（无法覆盖连接与握手阶段的挂起）。'
+            $exitCode = 0
+        }
     }
-}
 
-if (-not $hardTimeoutUsable) {
-    if (-not $timeoutExe) {
-        Write-Host '[WARN] 未找到 timeout.exe，退回低速阈值超时（无法覆盖连接与握手阶段的挂起）。'
+    if (-not $hardTimeoutUsable) {
+        if (-not $timeoutExe) {
+            Write-Host '[WARN] 未找到 timeout.exe，退回低速阈值超时（无法覆盖连接与握手阶段的挂起）。'
+        }
+        $env:GIT_HTTP_LOW_SPEED_LIMIT = '1000'
+        $env:GIT_HTTP_LOW_SPEED_TIME = "$TimeoutSec"
+        git -c credential.interactive=false ls-remote $Remote HEAD 1> $stdoutFile 2> $stderrFile
+        $exitCode = $LASTEXITCODE
     }
-    $env:GIT_HTTP_LOW_SPEED_LIMIT = '1000'
-    $env:GIT_HTTP_LOW_SPEED_TIME = "$TimeoutSec"
-    git ls-remote $Remote HEAD 1> $stdoutFile 2> $stderrFile
-    $exitCode = $LASTEXITCODE
+
+    $sw.Stop()
+
+    $stdout = @(Get-Content -LiteralPath $stdoutFile -ErrorAction SilentlyContinue)
+    $stderr = @(Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue)
 }
+finally {
+    # 临时文件里是 git 原始输出，可能含带凭据的 URL，必须确保清理
+    Remove-Item $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
 
-$sw.Stop()
+    # 恢复被回退分支改动的环境变量
+    $env:GIT_HTTP_LOW_SPEED_LIMIT = $lowSpeedLimitBefore
+    $env:GIT_HTTP_LOW_SPEED_TIME = $lowSpeedTimeBefore
 
-$stdout = @(Get-Content -LiteralPath $stdoutFile -ErrorAction SilentlyContinue)
-$stderr = @(Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue)
-Remove-Item $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
+    $ErrorActionPreference = $prefBefore
+}
 
 # 124 是 timeout 命令的超时退出码
 if ($exitCode -eq 124) {
@@ -173,7 +224,9 @@ if ($exitCode -eq 0) {
 }
 
 Write-Host ("[FAIL] git ls-remote 失败（退出码 {0}），耗时 {1} 秒" -f $exitCode, [math]::Round($sw.Elapsed.TotalSeconds, 1))
+# git 的典型报错本身就会带上完整 URL（fatal: unable to access 'https://user:token@...'），
+# 因此逐行脱敏后再输出，否则会绕过上面 Hide-Credential 的防护。
 foreach ($line in ($stderr + $stdout)) {
-    Write-Host ("       {0}" -f $line)
+    Write-Host ("       {0}" -f (Hide-Credential $line))
 }
 exit 1
