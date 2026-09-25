@@ -1,0 +1,17 @@
+# npm 全局安装与缓存（按需迁移到本盘的工作目录）
+/npm-global/
+/npm-cache/
+
+# 临时/验证脚本
+_validate_yaml.py
+_probe_deepseek.js
+
+# ocr 本地会话与输出
+.opencodereview/sessions/
+review.json
+*.sarif
+
+# 常见系统文件
+Thumbs.db
+desktop.ini
+.DS_Store

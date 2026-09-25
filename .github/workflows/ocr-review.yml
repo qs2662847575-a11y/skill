@@ -1,0 +1,127 @@
+# OpenCodeReview —— PR 自动审查
+#
+# 触发方式：
+#   1) PR 被创建/更新/重新打开时自动审查（pull_request_target）
+#   2) 在 PR 里评论 `/open-code-review` 手动重审（issue_comment）
+#
+# 前置配置（仓库 Settings → Secrets and variables → Actions）：
+#   Secrets:   OCR_LLM_AUTH_TOKEN   = DeepSeek API Key（必填）
+#   Variables: OCR_LLM_MODEL        = deepseek-flash
+#              OCR_LLM_USE_ANTHROPIC = false
+#              OCR_LLM_URL           = https://api.deepseek.com
+#
+# 说明：
+#   - 用 pull_request_target 而不是 pull_request，这样 fork 提的 PR 也能拿到 secrets。
+#     安全性依据：该 action 只读取 diff，不执行 PR 里的任何代码。
+#   - action 固定在 v1.12.9 的 commit SHA 上，避免 @main 漂移导致审查行为突变。
+#     想升级时，改下面的 SHA 并把 ocr_version 一起改掉（见 README 的「可复现固定」一节）。
+
+name: OpenCodeReview PR Review
+
+# 官方示例的条件化并发组：
+#   GitHub 在 job 级 if 之前就评估 concurrency，所以如果用一个扁平的 group，
+#   任何一条普通评论都会取消正在跑的审查。这里让「匹配的事件」共用 per-PR 组，
+#   不匹配的评论落到独一无二的 noop-<run_id> 组，瞬间跳过且不干扰正在跑的审查。
+concurrency:
+  group: >-
+    ${{
+      (
+        github.event_name == 'pull_request_target'
+        || (
+          github.event_name == 'issue_comment'
+          && github.event.issue.pull_request
+          && github.event.comment.user.type != 'Bot'
+          && (
+            github.event.comment.author_association == 'MEMBER'
+            || github.event.comment.author_association == 'OWNER'
+            || github.event.comment.author_association == 'COLLABORATOR'
+          )
+          && (
+            startsWith(github.event.comment.body, '/open-code-review')
+            || startsWith(github.event.comment.body, '@open-code-review')
+          )
+        )
+      )
+      && format('ocr-{0}', github.event.pull_request.number || github.event.issue.number)
+      || format('noop-{0}', github.run_id)
+    }}
+  cancel-in-progress: true
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # PR 事件直接跑；评论触发则额外要求是真人（非 Bot）且为仓库协作者，
+    # 避免任何人通过评论消耗你的 LLM 额度。
+    if: |
+      github.event_name == 'pull_request_target'
+      || (
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && github.event.comment.user.type != 'Bot'
+        && (
+          github.event.comment.author_association == 'MEMBER'
+          || github.event.comment.author_association == 'OWNER'
+          || github.event.comment.author_association == 'COLLABORATOR'
+        )
+        && (
+          startsWith(github.event.comment.body, '/open-code-review')
+          || startsWith(github.event.comment.body, '@open-code-review')
+        )
+      )
+    steps:
+      # issue_comment 事件没有 pull_request 字段，需要自己解析 base/head 传下去
+      - name: 解析 PR 上下文
+        id: pr-context
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            core.setOutput('base_ref', pullRequest.base.ref);
+            core.setOutput('head_sha', pullRequest.head.sha);
+            core.setOutput('title', pullRequest.title);
+
+      - name: 运行 OpenCodeReview
+        uses: alibaba/open-code-review@bccbc15f785269400735d5255540c231e6c02b6d # v1.12.9
+        with:
+          # --- LLM（DeepSeek，走 OpenAI 兼容协议）---
+          llm_url: ${{ vars.OCR_LLM_URL }}
+          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          llm_model: ${{ vars.OCR_LLM_MODEL }}
+          llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          # DeepSeek 不认识 action 默认的 {"thinking":{"type":"disabled"}}，
+          # 传空对象避免请求体被拒。换回支持该字段的厂商时删掉这一行即可。
+          llm_extra_body: '{}'
+
+          # --- 审查行为 ---
+          language: Chinese
+          effort: medium
+          # 单次审查总 token 上限，防止大 PR 烧钱；0 或留空表示不限
+          max_tokens_budget: '3000000'
+          # 用 PR 标题当需求背景，标题遵循语义化约定时效果更好
+          background: ${{ steps.pr-context.outputs.title || github.event.pull_request.title }}
+
+          # --- 评论投递 ---
+          sticky_summary: 'true'   # 摘要评论原地更新，不刷屏
+          incremental: 'true'      # 只追加不重复的行内评论，历史不删
+          upload_artifacts: 'true' # 上传原始 JSON 与 stderr，便于排错
+
+          # issue_comment 触发时传解析出的 ref；pull_request_target 时 action 自己解析
+          base_ref: ${{ steps.pr-context.outputs.base_ref }}
+          head_sha: ${{ steps.pr-context.outputs.head_sha }}
