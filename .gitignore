@@ -6,6 +6,14 @@
 _validate_yaml.py
 _probe_deepseek.js
 
+# 配置过程的临时目录（含 token，绝不能提交）
+_ci-tmp/
+
+# 为加密 Actions secret 临时安装的依赖
+/node_modules/
+package.json
+package-lock.json
+
 # ocr 本地会话与输出
 .opencodereview/sessions/
 review.json
